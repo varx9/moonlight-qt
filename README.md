@@ -10,6 +10,20 @@ You can follow development on our [Discord server](https://moonlight-stream.org/
  [![Downloads](https://img.shields.io/github/downloads/moonlight-stream/moonlight-qt/total)](https://github.com/moonlight-stream/moonlight-qt/releases)
  [![Translation Status](https://hosted.weblate.org/widgets/moonlight/-/moonlight-qt/svg-badge.svg)](https://hosted.weblate.org/projects/moonlight/moonlight-qt/)
 
+## Fork notes (varx9)
+
+This repository is a personal fork with optional **master-based** fix branches (not official Moonlight releases):
+
+| Branch | Fix |
+|--------|-----|
+| `fix/brightness-plvk-sdr` | Over-bright SDR with Vulkan/libplacebo |
+| `fix/audio-hdmi-reopen` | HDMI/DP audio sink reopen after teardown |
+| `fix/varx9-master` | Both of the above |
+
+Details, build steps, and verification: **[docs/varx9-fixes.md](docs/varx9-fixes.md)**.
+
+These fixes were investigated and implemented with assistance from **Grok 4.5** (xAI).
+
 ## Features
  - Hardware accelerated video decoding on Windows, Mac, and Linux
  - H.264, HEVC, and AV1 codec support (AV1 requires Sunshine and a supported host GPU)
