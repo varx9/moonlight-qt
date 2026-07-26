@@ -187,6 +187,29 @@ void Session::arDecodeAndPlaySample(char* sampleData, int sampleLength)
         return;
     }
 
+    // Sink teardown notification from the SDL event thread: drop the dead
+    // renderer so we reopen on the current default (new object ID after HDMI/DP
+    // monitor power-cycle). Safe here — this is the only audio owner thread.
+    if (SDL_AtomicGet(&s_ActiveSession->m_AudioOutputNeedsReinit)) {
+        SDL_AtomicSet(&s_ActiveSession->m_AudioOutputNeedsReinit, 0);
+
+        if (s_ActiveSession->m_AudioRenderer != nullptr) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "Audio output device change detected; reinitializing audio renderer");
+
+            opus_multistream_decoder_destroy(s_ActiveSession->m_OpusDecoder);
+            s_ActiveSession->m_OpusDecoder = nullptr;
+
+            delete s_ActiveSession->m_AudioRenderer;
+            s_ActiveSession->m_AudioRenderer = nullptr;
+        }
+
+        // Retry promptly after the device event (do not wait for sample modulo).
+        s_ActiveSession->m_AudioReinitBackoffMs = 200;
+        s_ActiveSession->m_AudioNextReinitMs = SDL_GetTicks();
+        s_ActiveSession->m_AudioReinitFailCount = 0;
+    }
+
     if (s_ActiveSession->m_AudioRenderer != nullptr) {
         int sampleSize = s_ActiveSession->m_AudioRenderer->getAudioBufferSampleSize();
         int frameSize = sampleSize * s_ActiveSession->m_ActiveAudioConfig.channelCount;
@@ -224,32 +247,81 @@ void Session::arDecodeAndPlaySample(char* sampleData, int sampleLength)
 
         if (!s_ActiveSession->m_AudioRenderer->submitAudio(desiredBufferSize)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "Reinitializing audio renderer after failure");
+                        "Audio output lost or stalled; reinitializing audio renderer");
 
             opus_multistream_decoder_destroy(s_ActiveSession->m_OpusDecoder);
             s_ActiveSession->m_OpusDecoder = nullptr;
 
             delete s_ActiveSession->m_AudioRenderer;
             s_ActiveSession->m_AudioRenderer = nullptr;
+
+            s_ActiveSession->m_AudioReinitBackoffMs = 200;
+            s_ActiveSession->m_AudioNextReinitMs = SDL_GetTicks();
+            s_ActiveSession->m_AudioReinitFailCount = 0;
         }
     }
 
-    // Only try to recreate the audio renderer every 200 samples (1 second)
-    // to avoid thrashing if the audio device is unavailable. It is
-    // safe to reinitialize here because we can't be torn down while
-    // the audio decoder/playback thread is still alive.
-    if (s_ActiveSession->m_AudioRenderer == nullptr && (s_ActiveSession->m_AudioSampleCount % 200) == 0) {
-        // Since we're doing this inline and audio initialization takes time, we need
-        // to drop samples to account for the time we've spent blocking audio rendering
-        // so we return to real-time playback and don't accumulate latency.
-        Uint32 audioReinitStartTime = SDL_GetTicks();
+    // Recreate the audio renderer when missing. Time-based exponential backoff
+    // retries quickly after sink recreation and avoids spinning when no output
+    // exists. Safe: we can't be torn down while this thread is still alive.
+    if (s_ActiveSession->m_AudioRenderer == nullptr) {
+        Uint32 now = SDL_GetTicks();
+
+        // A new sink appeared while we were waiting — attempt immediately.
+        if (SDL_AtomicGet(&s_ActiveSession->m_AudioOutputAvailable)) {
+            SDL_AtomicSet(&s_ActiveSession->m_AudioOutputAvailable, 0);
+            s_ActiveSession->m_AudioNextReinitMs = now;
+            s_ActiveSession->m_AudioReinitFailCount = 0;
+            s_ActiveSession->m_AudioReinitBackoffMs = 200;
+        }
+
+        if (s_ActiveSession->m_AudioNextReinitMs != 0) {
+            // Scheduled attempt (after failure or device event)
+            if (!SDL_TICKS_PASSED(now, s_ActiveSession->m_AudioNextReinitMs)) {
+                return;
+            }
+        }
+        else {
+            // No schedule yet: preserve historical ~1s cadence (200 x 5 ms frames)
+            // used when audio was unavailable at stream start.
+            if ((s_ActiveSession->m_AudioSampleCount % 200) != 0) {
+                return;
+            }
+        }
+
+        Uint32 audioReinitStartTime = now;
         if (s_ActiveSession->initializeAudioRenderer()) {
             Uint32 audioReinitStopTime = SDL_GetTicks();
 
             s_ActiveSession->m_DropAudioEndTime = audioReinitStopTime + (audioReinitStopTime - audioReinitStartTime);
+            s_ActiveSession->m_AudioReinitFailCount = 0;
+            s_ActiveSession->m_AudioReinitBackoffMs = 200;
+            s_ActiveSession->m_AudioNextReinitMs = 0;
+
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "Audio reinitialization took %d ms - starting drop window",
-                        audioReinitStopTime - audioReinitStartTime);
+                        "Audio reinitialization succeeded in %u ms - starting drop window",
+                        (unsigned)(audioReinitStopTime - audioReinitStartTime));
+        }
+        else {
+            // Exponential backoff capped at 5s when output remains unavailable.
+            s_ActiveSession->m_AudioReinitFailCount++;
+            if (s_ActiveSession->m_AudioReinitFailCount == 1) {
+                s_ActiveSession->m_AudioReinitBackoffMs = 200;
+            }
+            else if (s_ActiveSession->m_AudioReinitBackoffMs < 5000) {
+                s_ActiveSession->m_AudioReinitBackoffMs =
+                    SDL_min((Uint32)5000, s_ActiveSession->m_AudioReinitBackoffMs * 2);
+            }
+            s_ActiveSession->m_AudioNextReinitMs =
+                SDL_GetTicks() + s_ActiveSession->m_AudioReinitBackoffMs;
+
+            if (s_ActiveSession->m_AudioReinitFailCount == 1 ||
+                    (s_ActiveSession->m_AudioReinitFailCount % 4) == 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Audio output unavailable; retrying in %u ms (attempt %d)",
+                            (unsigned)s_ActiveSession->m_AudioReinitBackoffMs,
+                            s_ActiveSession->m_AudioReinitFailCount);
+            }
         }
     }
 }

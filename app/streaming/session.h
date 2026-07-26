@@ -279,6 +279,15 @@ private:
     OPUS_MULTISTREAM_CONFIGURATION m_OriginalAudioConfig;
     int m_AudioSampleCount;
     Uint32 m_DropAudioEndTime;
+    // Set from the SDL event thread when an opened/enumerated output device is
+    // removed so the audio decode thread tears down and reopens (no host reconnect).
+    SDL_atomic_t m_AudioOutputNeedsReinit;
+    // Set when a new output device appears; only accelerates reinit if we currently
+    // have no renderer (avoids glitching a healthy stream on unrelated hotplug).
+    SDL_atomic_t m_AudioOutputAvailable;
+    Uint32 m_AudioReinitBackoffMs;
+    Uint32 m_AudioNextReinitMs;
+    int m_AudioReinitFailCount;
 
     Overlay::OverlayManager m_OverlayManager;
 
