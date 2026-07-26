@@ -584,8 +584,13 @@ Session::Session(NvComputer* computer, NvApp& app, StreamingPreferences *prefere
       m_OpusDecoder(nullptr),
       m_AudioRenderer(nullptr),
       m_AudioSampleCount(0),
-      m_DropAudioEndTime(0)
+      m_DropAudioEndTime(0),
+      m_AudioReinitBackoffMs(200),
+      m_AudioNextReinitMs(0),
+      m_AudioReinitFailCount(0)
 {
+    SDL_AtomicSet(&m_AudioOutputNeedsReinit, 0);
+    SDL_AtomicSet(&m_AudioOutputAvailable, 0);
 }
 
 Session::~Session()
@@ -2000,6 +2005,32 @@ void Session::exec()
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "Quit event received");
             goto DispatchDeferredCleanup;
+
+        case SDL_AUDIODEVICEREMOVED:
+            // which != 0: an opened SDL device was lost — force reopen.
+            // which == 0: an enumerated (not opened-by-id) sink disappeared.
+            // Default-device opens often take this path when HDMI/DP sinks die;
+            // submitAudio starvation / STOPPED detection reopens in that case
+            // without glitching healthy streams when an unrelated sink vanishes.
+            if (!event.adevice.iscapture && event.adevice.which != 0) {
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "Opened audio output device removed (id=%u); scheduling reopen",
+                            (unsigned)event.adevice.which);
+                SDL_AtomicSet(&m_AudioOutputNeedsReinit, 1);
+            }
+            break;
+
+        case SDL_AUDIODEVICEADDED:
+            // New sink may restore a previously missing default (monitor power-on).
+            // Only used to accelerate reinit when audio is already down — does not
+            // tear down a healthy stream (starvation / STOPPED handling covers that).
+            if (!event.adevice.iscapture) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "Audio output device added (index=%u)",
+                            (unsigned)event.adevice.which);
+                SDL_AtomicSet(&m_AudioOutputAvailable, 1);
+            }
+            break;
 
         case SDL_USEREVENT:
             switch (event.user.code) {
