@@ -709,11 +709,12 @@ bool PlVkRenderer::mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFra
         mappedFrame->color.hdr.min_luma = PL_COLOR_HDR_BLACK;
     }
 
-    // HACK: AMF AV1 encoding on the host PC does not set full color range properly in the
-    // bitstream data, so libplacebo incorrectly renders the content as limited range.
-    //
-    // As a workaround, set full range manually in the mapped frame ourselves.
-    mappedFrame->repr.levels = PL_COLOR_LEVELS_FULL;
+    // Trust color range from pl_map_avframe / the bitstream. We previously forced
+    // PL_COLOR_LEVELS_FULL here as a workaround for AMF AV1 hosts that mis-tag full
+    // range as limited. That blanket override made correctly tagged limited-range
+    // streams (and full-range streams interpreted with the wrong policy) over-bright
+    // with Vulkan Video + libplacebo compared to VAAPI+EGL. Prefer host metadata;
+    // COLOR_RANGE_OVERRIDE remains available at session setup if needed.
 
     return true;
 }
@@ -976,16 +977,21 @@ void PlVkRenderer::renderFrame(AVFrame *frame)
         m_LastColorspace = mappedFrame.color;
         SDL_assert(pl_color_space_equal(&mappedFrame.color, &m_LastColorspace));
 
-#ifdef Q_OS_DARWIN
-        // There is a gamma mismatch on macOS between what libplacebo thinks BT.709
-        // should use and what the Metal layer actually displays. Use sRGB for the
-        // swapchain when the incoming frames are BT.709 as a workaround.
-        if (pl_color_space_equal(&mappedFrame.color, &pl_color_space_bt709)) {
+        // For SDR Rec.709, hint an sRGB swapchain. Desktop displays are typically
+        // sRGB-encoded; using BT.1886 swapchain metadata with libplacebo was
+        // over-bright vs VAAPI+EGL on Nvidia/Wayland. macOS already required this
+        // for Metal gamma matching; apply the same policy on all platforms.
+        // Leave HDR (PQ/HLG) on the frame's native colorspace.
+        const bool isHdrTransfer = pl_color_transfer_is_hdr(mappedFrame.color.transfer);
+        const bool isBt709Sdr =
+            !isHdrTransfer &&
+            (mappedFrame.color.primaries == PL_COLOR_PRIM_BT_709 ||
+             pl_color_space_equal(&mappedFrame.color, &pl_color_space_bt709));
+
+        if (isBt709Sdr) {
             pl_swapchain_colorspace_hint(m_Swapchain, &pl_color_space_srgb);
         }
-        else
-#endif
-        {
+        else {
             pl_swapchain_colorspace_hint(m_Swapchain, &mappedFrame.color);
         }
     }
@@ -1291,9 +1297,10 @@ int PlVkRenderer::getDecoderColorspace()
 
 int PlVkRenderer::getDecoderColorRange()
 {
-    // Explicitly set the color range to full to fix raised black levels on OLED displays,
-    // should also reduce banding artifacts in all situations
-    return COLOR_RANGE_FULL;
+    // Limited (TV) range, matching other renderers. PlVk previously requested full
+    // range to help OLED black levels / banding, but full-range encode plus
+    // libplacebo presentation was over-bright on Nvidia/Wayland versus VAAPI+EGL.
+    return COLOR_RANGE_LIMITED;
 }
 
 int PlVkRenderer::getDecoderCapabilities()
